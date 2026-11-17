@@ -1,0 +1,14 @@
+bin/
+obj/
+.vs/
+.idea/
+*.user
+*.suo
+*.db
+*.db-shm
+*.db-wal
+**/appsettings.json
+**/appsettings.*.json
+!**/appsettings.example.json
+**/profile/candidate.md
+src/JobAgent.WebApi/wwwroot/

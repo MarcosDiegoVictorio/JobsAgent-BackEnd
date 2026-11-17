@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/JobAgent.Domain/JobAgent.Domain.csproj" />
+    <Project Path="src/JobAgent.Repository/JobAgent.Repository.csproj" />
+    <Project Path="src/JobAgent.Service/JobAgent.Service.csproj" />
+    <Project Path="src/JobAgent.WebApi/JobAgent.WebApi.csproj" />
+    <Project Path="src/JobAgent.Worker/JobAgent.Worker.csproj" />
+  </Folder>
+</Solution>
