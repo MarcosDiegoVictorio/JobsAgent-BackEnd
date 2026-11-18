@@ -1,42 +1,28 @@
+using System.Data.Common;
 using System.Globalization;
 using JobAgent.Domain.Entities;
 using JobAgent.Domain.Interfaces;
-using Microsoft.Data.Sqlite;
-using Microsoft.Extensions.Options;
-using JobAgent.Domain.Models;
 
 namespace JobAgent.Repository;
 
-public sealed class CandidateProfileRepository(IOptions<AgentOptions> options) : ICandidateProfileRepository
+public sealed class CandidateProfileRepository(DatabaseConnectionFactory connections) : ICandidateProfileRepository
 {
-    private string ConnectionString
+    public async Task<IReadOnlyList<CandidateProfile>> GetAllAsync(string userId, CancellationToken ct = default)
     {
-        get
-        {
-            var dbPath = options.Value.DatabasePath;
-            if (!Path.IsPathRooted(dbPath))
-            {
-                dbPath = Path.Combine(AppContext.BaseDirectory, dbPath);
-            }
-
-            return $"Data Source={dbPath}";
-        }
-    }
-
-    public async Task<IReadOnlyList<CandidateProfile>> GetAllAsync(CancellationToken ct = default)
-    {
-        await using var conn = await OpenConnectionAsync(ct);
-        var cmd = conn.CreateCommand();
-        cmd.CommandText = """
+        await using var connection = await connections.OpenConnectionAsync(ct);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
             SELECT p.id, p.name, p.profile_markdown, p.is_active, p.created_at, p.updated_at,
                    k.keyword, k.is_excluded
-            FROM candidate_profiles p
-            LEFT JOIN candidate_profile_keywords k ON k.profile_id = p.id
+            FROM user_profiles p
+            LEFT JOIN user_profile_keywords k ON k.profile_id = p.id
+            WHERE p.user_id = @userId
             ORDER BY p.is_active DESC, p.created_at, k.is_excluded, k.sort_order
             """;
+        Add(command, ("@userId", userId));
 
         var profiles = new Dictionary<string, CandidateProfile>(StringComparer.Ordinal);
-        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
         {
             var id = reader.GetString(0);
@@ -47,9 +33,9 @@ public sealed class CandidateProfileRepository(IOptions<AgentOptions> options) :
                     Id = id,
                     Name = reader.GetString(1),
                     ProfileMarkdown = reader.GetString(2),
-                    IsActive = reader.GetInt32(3) == 1,
-                    CreatedAt = ParseDate(reader.GetString(4)),
-                    UpdatedAt = ParseDate(reader.GetString(5))
+                    IsActive = Convert.ToInt32(reader.GetValue(3), CultureInfo.InvariantCulture) == 1,
+                    CreatedAt = ParseDate(reader.GetValue(4).ToString()),
+                    UpdatedAt = ParseDate(reader.GetValue(5).ToString())
                 };
                 profiles.Add(id, profile);
             }
@@ -59,141 +45,133 @@ public sealed class CandidateProfileRepository(IOptions<AgentOptions> options) :
                 continue;
             }
 
-            var keyword = reader.GetString(6);
-            if (reader.GetInt32(7) == 1)
+            if (Convert.ToInt32(reader.GetValue(7), CultureInfo.InvariantCulture) == 1)
             {
-                profile.ExcludeTitleKeywords.Add(keyword);
+                profile.ExcludeTitleKeywords.Add(reader.GetString(6));
             }
             else
             {
-                profile.IncludeTitleKeywords.Add(keyword);
+                profile.IncludeTitleKeywords.Add(reader.GetString(6));
             }
         }
 
         return profiles.Values.ToList();
     }
 
-    public async Task<CandidateProfile?> GetActiveAsync(CancellationToken ct = default)
+    public async Task<CandidateProfile?> GetActiveAsync(string userId, CancellationToken ct = default) =>
+        (await GetAllAsync(userId, ct)).FirstOrDefault(profile => profile.IsActive);
+
+    public async Task<CandidateProfile> EnsureDefaultAsync(
+        string userId,
+        CandidateProfile profile,
+        CancellationToken ct = default)
     {
-        var profiles = await GetAllAsync(ct);
-        return profiles.FirstOrDefault(profile => profile.IsActive);
+        var active = await GetActiveAsync(userId, ct);
+        if (active is not null)
+        {
+            return active;
+        }
+
+        profile.Id = Guid.NewGuid().ToString("N");
+        profile.Name = "Perfil padrão";
+        profile.IsActive = true;
+        return await CreateAndActivateAsync(userId, profile, ct);
     }
 
-    public async Task<CandidateProfile> EnsureDefaultAsync(CandidateProfile profile, CancellationToken ct = default)
+    public async Task<CandidateProfile> SaveActiveAsync(
+        string userId,
+        CandidateProfile profile,
+        CancellationToken ct = default)
     {
-        await using var conn = await OpenConnectionAsync(ct);
-        using var transaction = conn.BeginTransaction();
-
-        var activeCmd = conn.CreateCommand();
-        activeCmd.Transaction = transaction;
-        activeCmd.CommandText = "SELECT 1 FROM candidate_profiles WHERE is_active = 1 LIMIT 1";
-        if (await activeCmd.ExecuteScalarAsync(ct) is not null)
-        {
-            await transaction.CommitAsync(ct);
-            return (await GetActiveAsync(ct))!;
-        }
-
-        var defaultCmd = conn.CreateCommand();
-        defaultCmd.Transaction = transaction;
-        defaultCmd.CommandText = "SELECT 1 FROM candidate_profiles WHERE id = 'default' LIMIT 1";
-        var defaultExists = await defaultCmd.ExecuteScalarAsync(ct) is not null;
-        if (!defaultExists)
-        {
-            var insertCmd = conn.CreateCommand();
-            insertCmd.Transaction = transaction;
-            insertCmd.CommandText = """
-                INSERT INTO candidate_profiles (id, name, profile_markdown, is_active, created_at, updated_at)
-                VALUES ('default', $name, $markdown, 1, $created, $updated)
-                """;
-            AddProfileParameters(insertCmd, profile);
-            await insertCmd.ExecuteNonQueryAsync(ct);
-            await InsertKeywordsAsync(conn, transaction, profile, ct);
-        }
-        else
-        {
-            var activateCmd = conn.CreateCommand();
-            activateCmd.Transaction = transaction;
-            activateCmd.CommandText = "UPDATE candidate_profiles SET is_active = 1 WHERE id = 'default'";
-            await activateCmd.ExecuteNonQueryAsync(ct);
-        }
-
-        await transaction.CommitAsync(ct);
-        return (await GetActiveAsync(ct))!;
-    }
-
-    public async Task<CandidateProfile> SaveActiveAsync(CandidateProfile profile, CancellationToken ct = default)
-    {
-        await using var conn = await OpenConnectionAsync(ct);
-        using var transaction = conn.BeginTransaction();
-
-        var updateCmd = conn.CreateCommand();
-        updateCmd.Transaction = transaction;
-        updateCmd.CommandText = """
-            UPDATE candidate_profiles
-            SET profile_markdown = $markdown, updated_at = $updated
-            WHERE id = $id AND is_active = 1
+        await using var connection = await connections.OpenConnectionAsync(ct);
+        await using var transaction = await connection.BeginTransactionAsync(ct);
+        await using var update = connection.CreateCommand();
+        update.Transaction = transaction;
+        update.CommandText = """
+            UPDATE user_profiles
+            SET profile_markdown = @markdown, updated_at = @updated
+            WHERE id = @id AND user_id = @userId AND is_active = 1
             """;
-        updateCmd.Parameters.AddWithValue("$markdown", profile.ProfileMarkdown);
-        updateCmd.Parameters.AddWithValue("$updated", DateTimeOffset.UtcNow.ToString("O"));
-        updateCmd.Parameters.AddWithValue("$id", profile.Id);
-        if (await updateCmd.ExecuteNonQueryAsync(ct) == 0)
+        Add(update,
+            ("@markdown", profile.ProfileMarkdown),
+            ("@updated", DateTimeOffset.UtcNow.ToString("O")),
+            ("@id", profile.Id),
+            ("@userId", userId));
+        if (await update.ExecuteNonQueryAsync(ct) == 0)
         {
             throw new InvalidOperationException("O perfil ativo não foi encontrado.");
         }
 
-        await ReplaceKeywordsAsync(conn, transaction, profile, ct);
+        await ReplaceKeywordsAsync(connection, transaction, profile, ct);
         await transaction.CommitAsync(ct);
-        return (await GetActiveAsync(ct))!;
+        return (await GetActiveAsync(userId, ct))!;
     }
 
-    public async Task<CandidateProfile> CreateAndActivateAsync(CandidateProfile profile, CancellationToken ct = default)
+    public async Task<CandidateProfile> CreateAndActivateAsync(
+        string userId,
+        CandidateProfile profile,
+        CancellationToken ct = default)
     {
-        await using var conn = await OpenConnectionAsync(ct);
-        using var transaction = conn.BeginTransaction();
-
+        await using var connection = await connections.OpenConnectionAsync(ct);
+        await using var transaction = await connection.BeginTransactionAsync(ct);
         try
         {
-            var deactivateCmd = conn.CreateCommand();
-            deactivateCmd.Transaction = transaction;
-            deactivateCmd.CommandText = "UPDATE candidate_profiles SET is_active = 0 WHERE is_active = 1";
-            await deactivateCmd.ExecuteNonQueryAsync(ct);
+            await using var deactivate = connection.CreateCommand();
+            deactivate.Transaction = transaction;
+            deactivate.CommandText = "UPDATE user_profiles SET is_active = 0 WHERE user_id = @userId AND is_active = 1";
+            Add(deactivate, ("@userId", userId));
+            await deactivate.ExecuteNonQueryAsync(ct);
 
-            var insertCmd = conn.CreateCommand();
-            insertCmd.Transaction = transaction;
-            insertCmd.CommandText = """
-                INSERT INTO candidate_profiles (id, name, profile_markdown, is_active, created_at, updated_at)
-                VALUES ($id, $name, $markdown, 1, $created, $updated)
+            await using var insert = connection.CreateCommand();
+            insert.Transaction = transaction;
+            insert.CommandText = """
+                INSERT INTO user_profiles
+                    (id, user_id, name, name_normalized, profile_markdown, is_active, created_at, updated_at)
+                VALUES
+                    (@id, @userId, @name, @normalized, @markdown, 1, @created, @updated)
                 """;
-            AddProfileParameters(insertCmd, profile);
-            insertCmd.Parameters.AddWithValue("$id", profile.Id);
-            await insertCmd.ExecuteNonQueryAsync(ct);
-            await InsertKeywordsAsync(conn, transaction, profile, ct);
+            Add(insert,
+                ("@id", profile.Id),
+                ("@userId", userId),
+                ("@name", profile.Name),
+                ("@normalized", NormalizeName(profile.Name)),
+                ("@markdown", profile.ProfileMarkdown),
+                ("@created", profile.CreatedAt.ToString("O")),
+                ("@updated", profile.UpdatedAt.ToString("O")));
+            await insert.ExecuteNonQueryAsync(ct);
+            await InsertKeywordsAsync(connection, transaction, profile, ct);
             await transaction.CommitAsync(ct);
         }
-        catch (SqliteException ex) when (ex.SqliteErrorCode == 19)
+        catch (DbException ex) when (IsUniqueConstraintViolation(ex))
         {
             await transaction.RollbackAsync(ct);
             throw new InvalidOperationException("Já existe um perfil com esse nome.", ex);
         }
 
-        return (await GetActiveAsync(ct))!;
+        return (await GetActiveAsync(userId, ct))!;
     }
 
-    public async Task<bool> ActivateAsync(string id, CancellationToken ct = default)
+    public async Task<bool> ActivateAsync(string userId, string id, CancellationToken ct = default)
     {
-        await using var conn = await OpenConnectionAsync(ct);
-        using var transaction = conn.BeginTransaction();
+        await using var connection = await connections.OpenConnectionAsync(ct);
+        await using var transaction = await connection.BeginTransactionAsync(ct);
 
-        var deactivateCmd = conn.CreateCommand();
-        deactivateCmd.Transaction = transaction;
-        deactivateCmd.CommandText = "UPDATE candidate_profiles SET is_active = 0 WHERE is_active = 1";
-        await deactivateCmd.ExecuteNonQueryAsync(ct);
+        await using (var deactivate = connection.CreateCommand())
+        {
+            deactivate.Transaction = transaction;
+            deactivate.CommandText = "UPDATE user_profiles SET is_active = 0 WHERE user_id = @userId AND is_active = 1";
+            Add(deactivate, ("@userId", userId));
+            await deactivate.ExecuteNonQueryAsync(ct);
+        }
 
-        var activateCmd = conn.CreateCommand();
-        activateCmd.Transaction = transaction;
-        activateCmd.CommandText = "UPDATE candidate_profiles SET is_active = 1 WHERE id = $id";
-        activateCmd.Parameters.AddWithValue("$id", id);
-        if (await activateCmd.ExecuteNonQueryAsync(ct) == 0)
+        await using var activate = connection.CreateCommand();
+        activate.Transaction = transaction;
+        activate.CommandText = """
+            UPDATE user_profiles SET is_active = 1, updated_at = @updated
+            WHERE id = @id AND user_id = @userId
+            """;
+        Add(activate, ("@updated", DateTimeOffset.UtcNow.ToString("O")), ("@id", id), ("@userId", userId));
+        if (await activate.ExecuteNonQueryAsync(ct) == 0)
         {
             await transaction.RollbackAsync(ct);
             return false;
@@ -203,41 +181,105 @@ public sealed class CandidateProfileRepository(IOptions<AgentOptions> options) :
         return true;
     }
 
-    private async Task<SqliteConnection> OpenConnectionAsync(CancellationToken ct)
+    public async Task MigrateLegacyProfilesAsync(string userId, CancellationToken ct = default)
     {
-        var conn = new SqliteConnection(ConnectionString);
-        await conn.OpenAsync(ct);
-        var pragma = conn.CreateCommand();
-        pragma.CommandText = "PRAGMA foreign_keys = ON";
-        await pragma.ExecuteNonQueryAsync(ct);
-        return conn;
+        await using var connection = await connections.OpenConnectionAsync(ct);
+        if (!await LegacyProfilesExistAsync(connection, ct))
+        {
+            return;
+        }
+
+        await using var transaction = await connection.BeginTransactionAsync(ct);
+        var migrationId = $"legacy-profiles-{userId}";
+        await using var migrationCheck = connection.CreateCommand();
+        migrationCheck.Transaction = transaction;
+        migrationCheck.CommandText = "SELECT 1 FROM data_migrations WHERE id = @id";
+        Add(migrationCheck, ("@id", migrationId));
+        if (await migrationCheck.ExecuteScalarAsync(ct) is not null)
+        {
+            await transaction.CommitAsync(ct);
+            return;
+        }
+
+        await using var hasProfiles = connection.CreateCommand();
+        hasProfiles.Transaction = transaction;
+        hasProfiles.CommandText = "SELECT 1 FROM user_profiles WHERE user_id = @userId LIMIT 1";
+        Add(hasProfiles, ("@userId", userId));
+        if (await hasProfiles.ExecuteScalarAsync(ct) is null)
+        {
+            await using var copyProfiles = connection.CreateCommand();
+            copyProfiles.Transaction = transaction;
+            copyProfiles.CommandText = """
+                INSERT INTO user_profiles
+                    (id, user_id, name, name_normalized, profile_markdown, is_active, created_at, updated_at)
+                SELECT id, @userId, name, LOWER(TRIM(name)), profile_markdown, is_active, created_at, updated_at
+                FROM candidate_profiles
+                """;
+            Add(copyProfiles, ("@userId", userId));
+            await copyProfiles.ExecuteNonQueryAsync(ct);
+
+            await using var copyKeywords = connection.CreateCommand();
+            copyKeywords.Transaction = transaction;
+            copyKeywords.CommandText = """
+                INSERT INTO user_profile_keywords (profile_id, keyword, is_excluded, sort_order)
+                SELECT k.profile_id, k.keyword, k.is_excluded, k.sort_order
+                FROM candidate_profile_keywords k
+                JOIN user_profiles p ON p.id = k.profile_id AND p.user_id = @userId
+                """;
+            Add(copyKeywords, ("@userId", userId));
+            await copyKeywords.ExecuteNonQueryAsync(ct);
+        }
+
+        await using var migrateJobs = connection.CreateCommand();
+        migrateJobs.Transaction = transaction;
+        migrateJobs.CommandText = """
+            UPDATE jobs SET user_id = @userId
+            WHERE id IN (
+                SELECT id FROM jobs
+                WHERE user_id = 'legacy'
+                ORDER BY score DESC, created_at DESC
+                LIMIT 10
+            )
+            """;
+        Add(migrateJobs, ("@userId", userId));
+        await migrateJobs.ExecuteNonQueryAsync(ct);
+
+        await using var markMigration = connection.CreateCommand();
+        markMigration.Transaction = transaction;
+        markMigration.CommandText = "INSERT INTO data_migrations (id, applied_at) VALUES (@id, @appliedAt)";
+        Add(markMigration,
+            ("@id", migrationId),
+            ("@appliedAt", DateTimeOffset.UtcNow.ToString("O")));
+        await markMigration.ExecuteNonQueryAsync(ct);
+        await transaction.CommitAsync(ct);
     }
 
-    private static void AddProfileParameters(SqliteCommand cmd, CandidateProfile profile)
+    private async Task<bool> LegacyProfilesExistAsync(DbConnection connection, CancellationToken ct)
     {
-        cmd.Parameters.AddWithValue("$name", profile.Name);
-        cmd.Parameters.AddWithValue("$markdown", profile.ProfileMarkdown);
-        cmd.Parameters.AddWithValue("$created", profile.CreatedAt.ToString("O"));
-        cmd.Parameters.AddWithValue("$updated", profile.UpdatedAt.ToString("O"));
+        await using var command = connection.CreateCommand();
+        command.CommandText = connections.IsPostgreSql
+            ? "SELECT to_regclass('public.candidate_profiles')"
+            : "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'candidate_profiles'";
+        return await command.ExecuteScalarAsync(ct) is not null and not DBNull;
     }
 
     private static async Task ReplaceKeywordsAsync(
-        SqliteConnection conn,
-        SqliteTransaction transaction,
+        DbConnection connection,
+        DbTransaction transaction,
         CandidateProfile profile,
         CancellationToken ct)
     {
-        var deleteCmd = conn.CreateCommand();
-        deleteCmd.Transaction = transaction;
-        deleteCmd.CommandText = "DELETE FROM candidate_profile_keywords WHERE profile_id = $id";
-        deleteCmd.Parameters.AddWithValue("$id", profile.Id);
-        await deleteCmd.ExecuteNonQueryAsync(ct);
-        await InsertKeywordsAsync(conn, transaction, profile, ct);
+        await using var delete = connection.CreateCommand();
+        delete.Transaction = transaction;
+        delete.CommandText = "DELETE FROM user_profile_keywords WHERE profile_id = @profileId";
+        Add(delete, ("@profileId", profile.Id));
+        await delete.ExecuteNonQueryAsync(ct);
+        await InsertKeywordsAsync(connection, transaction, profile, ct);
     }
 
     private static async Task InsertKeywordsAsync(
-        SqliteConnection conn,
-        SqliteTransaction transaction,
+        DbConnection connection,
+        DbTransaction transaction,
         CandidateProfile profile,
         CancellationToken ct)
     {
@@ -251,17 +293,18 @@ public sealed class CandidateProfileRepository(IOptions<AgentOptions> options) :
 
             for (var index = 0; index < uniqueKeywords.Count; index++)
             {
-                var cmd = conn.CreateCommand();
-                cmd.Transaction = transaction;
-                cmd.CommandText = """
-                    INSERT INTO candidate_profile_keywords (profile_id, keyword, is_excluded, sort_order)
-                    VALUES ($profileId, $keyword, $excluded, $sortOrder)
+                await using var command = connection.CreateCommand();
+                command.Transaction = transaction;
+                command.CommandText = """
+                    INSERT INTO user_profile_keywords (profile_id, keyword, is_excluded, sort_order)
+                    VALUES (@profileId, @keyword, @excluded, @sortOrder)
                     """;
-                cmd.Parameters.AddWithValue("$profileId", profile.Id);
-                cmd.Parameters.AddWithValue("$keyword", uniqueKeywords[index]);
-                cmd.Parameters.AddWithValue("$excluded", excluded ? 1 : 0);
-                cmd.Parameters.AddWithValue("$sortOrder", index);
-                await cmd.ExecuteNonQueryAsync(ct);
+                Add(command,
+                    ("@profileId", profile.Id),
+                    ("@keyword", uniqueKeywords[index]),
+                    ("@excluded", excluded ? 1 : 0),
+                    ("@sortOrder", index));
+                await command.ExecuteNonQueryAsync(ct);
             }
         }
 
@@ -269,7 +312,21 @@ public sealed class CandidateProfileRepository(IOptions<AgentOptions> options) :
         await InsertListAsync(profile.ExcludeTitleKeywords, excluded: true);
     }
 
-    private static DateTimeOffset ParseDate(string value) =>
+    private static void Add(DbCommand command, params (string Name, object Value)[] parameters)
+    {
+        foreach (var (name, value) in parameters)
+        {
+            DatabaseInitializer.AddParameter(command, name, value);
+        }
+    }
+
+    private static string NormalizeName(string name) => name.Trim().ToLowerInvariant();
+
+    private static bool IsUniqueConstraintViolation(DbException exception) =>
+        exception is Microsoft.Data.Sqlite.SqliteException { SqliteErrorCode: 19 }
+        || exception is Npgsql.PostgresException { SqlState: Npgsql.PostgresErrorCodes.UniqueViolation };
+
+    private static DateTimeOffset ParseDate(string? value) =>
         DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var date)
             ? date
             : DateTimeOffset.UtcNow;

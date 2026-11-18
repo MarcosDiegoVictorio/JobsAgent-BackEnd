@@ -3,15 +3,16 @@ namespace JobAgent.Domain.Models;
 public sealed class AppConfigDto
 {
     public AgentOptions Agent { get; set; } = new();
-    public GeminiOptions Gemini { get; set; } = new();
-    public AnthropicOptions Anthropic { get; set; } = new();
-    public TelegramOptions Telegram { get; set; } = new();
+    public bool GeminiConfigured { get; set; }
+    public bool AnthropicConfigured { get; set; }
+    public bool TelegramConfigured { get; set; }
     public RssOptions Rss { get; set; } = new();
-    public EmailOptions Email { get; set; } = new();
+    public bool EmailConfigured { get; set; }
 }
 
 public sealed class JobFilter
 {
+    public string UserId { get; set; } = string.Empty;
     public string ProfileId { get; set; } = string.Empty;
     public int Page { get; set; } = 1;
     public int PageSize { get; set; } = 20;
@@ -26,6 +27,7 @@ public sealed class JobFilter
 
 public sealed class JobSearchContext
 {
+    public string UserId { get; init; } = string.Empty;
     public string ProfileId { get; init; } = string.Empty;
     public IReadOnlyList<string> Keywords { get; init; } = [];
 }
@@ -117,4 +119,74 @@ public class CandidateProfileUpdateRequest
 public sealed class CandidateProfileCreateRequest : CandidateProfileUpdateRequest
 {
     public string Name { get; set; } = string.Empty;
+}
+
+public sealed class GoogleSignInRequest
+{
+    public string Credential { get; set; } = string.Empty;
+    public string Nonce { get; set; } = string.Empty;
+    public string? InviteCode { get; set; }
+}
+
+public sealed class AuthUserDto
+{
+    public string Id { get; set; } = string.Empty;
+    public string Email { get; set; } = string.Empty;
+    public string DisplayName { get; set; } = string.Empty;
+    public string? PictureUrl { get; set; }
+    public string Role { get; set; } = "user";
+    public int SearchCreditsRemaining { get; set; }
+    public int SavedJobsCount { get; set; }
+}
+
+public sealed class AuthResponseDto
+{
+    public string AccessToken { get; set; } = string.Empty;
+    public DateTimeOffset ExpiresAt { get; set; }
+    public AuthUserDto User { get; set; } = new();
+}
+
+public sealed class AdminUserDto
+{
+    public string Id { get; set; } = string.Empty;
+    public string Email { get; set; } = string.Empty;
+    public string DisplayName { get; set; } = string.Empty;
+    public string Role { get; set; } = string.Empty;
+    public int SearchCreditsRemaining { get; set; }
+    public int SavedJobsCount { get; set; }
+}
+
+public sealed class InvitationCreateRequest
+{
+    public string Email { get; set; } = string.Empty;
+    public int ExpiresInDays { get; set; } = 7;
+}
+
+public sealed class InvitationResponseDto
+{
+    public string Email { get; set; } = string.Empty;
+    public string InviteCode { get; set; } = string.Empty;
+    public DateTimeOffset ExpiresAt { get; set; }
+}
+
+public sealed class SearchCreditGrantDto
+{
+    public int SearchCreditsRemaining { get; set; }
+}
+
+public sealed class SearchReservationResult
+{
+    public bool Accepted { get; init; }
+    public string? RunId { get; init; }
+    public int RemainingCredits { get; init; }
+    public int SavedJobsCount { get; init; }
+    public string? Error { get; init; }
+}
+
+public sealed class SearchUserStatusDto
+{
+    public AuthUserDto User { get; set; } = new();
+    public int MaxSavedJobs { get; set; } = 10;
+    public int MaxInitialSearchCredits { get; set; } = 1;
+    public RunStatus LastRun { get; set; } = new();
 }

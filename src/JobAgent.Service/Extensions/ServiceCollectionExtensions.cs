@@ -18,6 +18,8 @@ public static class ServiceCollectionExtensions
         services.Configure<TelegramOptions>(configuration.GetSection("Telegram"));
         services.Configure<RssOptions>(configuration.GetSection("Rss"));
         services.Configure<EmailOptions>(configuration.GetSection("Email"));
+        services.Configure<AuthOptions>(configuration.GetSection("Auth"));
+        services.Configure<DatabaseOptions>(configuration.GetSection("Database"));
 
         // Http Clients
         services.AddHttpClient("Gemini", client =>
@@ -43,8 +45,11 @@ public static class ServiceCollectionExtensions
         });
 
         // Repository
+        services.AddSingleton<DatabaseConnectionFactory>();
+        services.AddSingleton<DatabaseInitializer>();
         services.AddSingleton<IJobRepository, JobRepository>();
         services.AddSingleton<ICandidateProfileRepository, CandidateProfileRepository>();
+        services.AddSingleton<IUserRepository, UserRepository>();
 
         // Core Scorer Services
         services.AddSingleton<GeminiScorer>();
@@ -54,13 +59,13 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IJobScorer>(sp => sp.GetRequiredService<LlmJobScorer>());
 
         services.AddSingleton<ITelegramNotifier, TelegramNotifier>();
+        services.AddSingleton<IAuthService, AuthService>();
         services.AddSingleton<IProfileService, ProfileService>();
         services.AddSingleton<IConfigurationService, ConfigurationService>();
         services.AddSingleton<IJobOrchestrator, JobOrchestrator>();
 
         // Sources
         services.AddSingleton<IJobSource, RssJobSource>();
-        services.AddSingleton<IJobSource, EmailAlertJobSource>();
         services.AddSingleton<IJobSource, GupyJobSource>();
 
         return services;

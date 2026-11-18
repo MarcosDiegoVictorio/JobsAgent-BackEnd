@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using JobAgent.Domain.Common;
 using JobAgent.Domain.Entities;
@@ -11,84 +12,85 @@ namespace JobAgent.Service;
 public sealed class JobOrchestrator(
     IEnumerable<IJobSource> sources,
     IJobRepository repo,
+    IUserRepository users,
     IJobScorer scorer,
-    ITelegramNotifier notifier,
     IProfileService profileService,
     IOptionsMonitor<AgentOptions> options,
     ILogger<JobOrchestrator> log) : IJobOrchestrator
 {
     private const int MaxConcurrentEvaluations = 2;
-    private static readonly SemaphoreSlim RunLock = new(1, 1);
-    private static readonly RunStatus Status = new();
+    private const int MaxSavedJobsPerUser = 10;
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> runLocks = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, RunStatus> statuses = new(StringComparer.Ordinal);
 
-    public RunStatus GetCurrentStatus()
+    public RunStatus GetCurrentStatus(string userId)
     {
-        lock (Status)
+        if (!statuses.TryGetValue(userId, out var status))
+        {
+            return new RunStatus();
+        }
+
+        lock (status)
         {
             return new RunStatus
             {
-                IsRunning = Status.IsRunning,
-                LastRunTime = Status.LastRunTime,
-                LastRunDuration = Status.LastRunDuration,
-                LastScoredCount = Status.LastScoredCount,
-                LastCollectedCount = Status.LastCollectedCount,
-                LastError = Status.LastError,
-                TotalRuns = Status.TotalRuns,
-                CurrentPhase = Status.CurrentPhase
+                IsRunning = status.IsRunning,
+                LastRunTime = status.LastRunTime,
+                LastRunDuration = status.LastRunDuration,
+                LastScoredCount = status.LastScoredCount,
+                LastCollectedCount = status.LastCollectedCount,
+                LastError = status.LastError,
+                TotalRuns = status.TotalRuns,
+                CurrentPhase = status.CurrentPhase
             };
         }
     }
 
-    public async Task<RunResult> RunOnceAsync(CancellationToken ct = default)
+    public async Task<RunResult> RunOnceAsync(string userId, string runId, CancellationToken ct = default)
     {
-        if (!await RunLock.WaitAsync(0, ct))
+        var runLock = runLocks.GetOrAdd(userId, _ => new SemaphoreSlim(1, 1));
+        if (!await runLock.WaitAsync(0, ct))
         {
-            log.LogInformation("Um ciclo de coleta/avaliação já está em andamento.");
-            return new RunResult
-            {
-                Errors = ["Um ciclo já está em execução."]
-            };
+            var concurrentResult = new RunResult { Errors = ["Já existe uma busca em andamento."] };
+            await users.CompleteSearchAsync(runId, concurrentResult, ct);
+            return concurrentResult;
         }
 
-        var sw = Stopwatch.StartNew();
+        var status = statuses.GetOrAdd(userId, _ => new RunStatus());
+        var stopwatch = Stopwatch.StartNew();
         var result = new RunResult();
-
-        lock (Status)
+        lock (status)
         {
-            Status.IsRunning = true;
-            Status.CurrentPhase = "Iniciando ciclo e preparando banco de dados...";
-            Status.LastError = null;
+            status.IsRunning = true;
+            status.CurrentPhase = "Preparando busca...";
+            status.LastError = null;
         }
 
         try
         {
-            await repo.InitAsync(ct);
+            var profile = await profileService.GetActiveProfileAsync(userId, ct);
+            if (string.IsNullOrWhiteSpace(profile.ProfileMarkdown))
+            {
+                result.Errors.Add("Preencha seu perfil antes de iniciar uma busca.");
+                return result;
+            }
 
-            var o = options.CurrentValue;
-            var profile = await profileService.GetActiveProfileAsync(ct);
-            var candidateProfile = profile.ProfileMarkdown;
+            var agentOptions = options.CurrentValue;
             var searchContext = new JobSearchContext
             {
+                UserId = userId,
                 ProfileId = profile.Id,
                 Keywords = profile.IncludeTitleKeywords
             };
-
-            if (string.IsNullOrWhiteSpace(candidateProfile))
-            {
-                var msg = "Perfil do candidato está vazio ou não foi encontrado.";
-                log.LogWarning(msg);
-                result.Errors.Add(msg);
-            }
-
             var seenThisRun = new HashSet<string>();
             var candidateJobs = new List<JobPosting>();
             var collectedCount = 0;
 
             foreach (var source in sources)
             {
-                lock (Status)
+                lock (status)
                 {
-                    Status.CurrentPhase = $"Buscando vagas da fonte: {source.Name}...";
+                    status.CurrentPhase = $"Buscando vagas da fonte: {source.Name}...";
                 }
 
                 IReadOnlyList<JobPosting> jobs;
@@ -98,118 +100,114 @@ public sealed class JobOrchestrator(
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
-                    log.LogWarning(ex, "Fonte {Source} falhou durante coleta", source.Name);
-                    result.Errors.Add($"Fonte {source.Name} falhou: {ex.Message}");
+                    log.LogWarning(ex, "Fonte {Source} falhou durante coleta para usuário {UserId}", source.Name, userId);
+                    result.Errors.Add($"Fonte {source.Name} falhou durante a busca.");
                     continue;
                 }
 
                 log.LogInformation("Fonte {Source}: {Count} vagas encontradas", source.Name, jobs.Count);
                 collectedCount += jobs.Count;
-
                 foreach (var job in jobs)
                 {
-                    var profileJob = profile.Id == "default"
-                        ? job
-                        : job with { Id = TextHelper.IdFor($"{profile.Id}:{job.Url}") };
-
-                    if (!seenThisRun.Add(profileJob.Id))
-                        continue;
-
-                    if (!PassesFilter(profileJob, profile.IncludeTitleKeywords, profile.ExcludeTitleKeywords))
-                        continue;
-
-                    candidateJobs.Add(profileJob);
+                    var scopedJob = job with { Id = TextHelper.IdFor($"{userId}:{profile.Id}:{job.Url}") };
+                    if (seenThisRun.Add(scopedJob.Id)
+                        && PassesFilter(scopedJob, profile.IncludeTitleKeywords, profile.ExcludeTitleKeywords))
+                    {
+                        candidateJobs.Add(scopedJob);
+                    }
                 }
             }
 
+            result.CollectedJobs = collectedCount;
+            var slotsRemaining = Math.Max(0, MaxSavedJobsPerUser - await repo.GetCountAsync(userId, ct));
             var jobsToScore = new List<JobPosting>();
             foreach (var job in candidateJobs
                          .OrderByDescending(GetRelevancePriority)
-                         .ThenByDescending(job => job.PublishedAt ?? DateTimeOffset.MinValue))
+                         .ThenByDescending(item => item.PublishedAt ?? DateTimeOffset.MinValue))
             {
-                if (jobsToScore.Count >= o.MaxJobsPerRun)
+                if (jobsToScore.Count >= Math.Min(slotsRemaining, Math.Max(0, agentOptions.MaxJobsPerRun)))
                 {
-                    log.LogInformation("Limite máximo de {Max} avaliações por ciclo atingido.", o.MaxJobsPerRun);
                     break;
                 }
 
-                if (!await repo.ExistsAsync(job.Id, profile.Id, ct))
+                if (!await repo.ExistsAsync(job.Id, userId, profile.Id, ct))
                 {
                     jobsToScore.Add(job);
                 }
             }
 
-            var scoredCount = 0;
             for (var batchStart = 0; batchStart < jobsToScore.Count; batchStart += MaxConcurrentEvaluations)
             {
                 var batchSize = Math.Min(MaxConcurrentEvaluations, jobsToScore.Count - batchStart);
                 var scores = new JobScore?[batchSize];
                 await Parallel.ForEachAsync(
                     Enumerable.Range(0, batchSize),
-                    new ParallelOptions
-                    {
-                        MaxDegreeOfParallelism = MaxConcurrentEvaluations,
-                        CancellationToken = ct
-                    },
+                    new ParallelOptions { MaxDegreeOfParallelism = MaxConcurrentEvaluations, CancellationToken = ct },
                     async (batchIndex, token) =>
                     {
                         var job = jobsToScore[batchStart + batchIndex];
-                        lock (Status)
+                        lock (status)
                         {
-                            Status.CurrentPhase = $"Avaliando vaga com IA: {job.Title}...";
+                            status.CurrentPhase = $"Avaliando vaga: {job.Title}...";
                         }
 
-                        scores[batchIndex] = await scorer.ScoreAsync(job, candidateProfile, token);
+                        scores[batchIndex] = await scorer.ScoreAsync(job, profile.ProfileMarkdown, token);
                     });
 
                 for (var batchIndex = 0; batchIndex < batchSize; batchIndex++)
                 {
                     var score = scores[batchIndex];
                     if (score is null)
+                    {
                         continue;
+                    }
 
                     var job = jobsToScore[batchStart + batchIndex];
-                    await repo.SaveAsync(job, score, profile.Id, ct);
-                    scoredCount++;
-                    log.LogInformation("Vaga avaliada: {Score}/10 — {Title} ({Company})", score.Score, job.Title, job.Company);
-
-                    if (score.Score >= o.MinScoreToNotify)
+                    if (await repo.SaveAsync(job, score, userId, profile.Id, ct))
                     {
-                        result.HighScoreJobs++;
-                        await notifier.SendAsync(job, score, ct);
+                        result.EvaluatedJobs++;
+                        if (score.Score >= agentOptions.MinScoreToNotify)
+                        {
+                            result.HighScoreJobs++;
+                        }
                     }
                 }
             }
 
-            result.CollectedJobs = collectedCount;
-            result.EvaluatedJobs = scoredCount;
+            if (slotsRemaining == 0)
+            {
+                result.Errors.Add("O limite de 10 vagas salvas foi atingido.");
+            }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            log.LogError(ex, "Erro inesperado na execução do ciclo de busca");
-            result.Errors.Add(ex.Message);
-            lock (Status)
-            {
-                Status.LastError = ex.Message;
-            }
+            log.LogError(ex, "Falha inesperada na busca do usuário {UserId}", userId);
+            result.Errors.Add("Ocorreu uma falha inesperada durante a busca.");
         }
         finally
         {
-            sw.Stop();
-            result.Duration = sw.Elapsed;
-
-            lock (Status)
+            stopwatch.Stop();
+            result.Duration = stopwatch.Elapsed;
+            lock (status)
             {
-                Status.IsRunning = false;
-                Status.LastRunTime = DateTimeOffset.UtcNow;
-                Status.LastRunDuration = sw.Elapsed;
-                Status.LastCollectedCount = result.CollectedJobs;
-                Status.LastScoredCount = result.EvaluatedJobs;
-                Status.TotalRuns++;
-                Status.CurrentPhase = "Concluído";
+                status.IsRunning = false;
+                status.LastRunTime = DateTimeOffset.UtcNow;
+                status.LastRunDuration = stopwatch.Elapsed;
+                status.LastCollectedCount = result.CollectedJobs;
+                status.LastScoredCount = result.EvaluatedJobs;
+                status.TotalRuns++;
+                status.LastError = result.Errors.Count == 0 ? null : string.Join(" ", result.Errors);
+                status.CurrentPhase = "Concluído";
             }
 
-            RunLock.Release();
+            try
+            {
+                await users.CompleteSearchAsync(runId, result, CancellationToken.None);
+            }
+            finally
+            {
+                runLock.Release();
+            }
         }
 
         return result;
@@ -221,13 +219,16 @@ public sealed class JobOrchestrator(
         IReadOnlyCollection<string> excludeKeywords)
     {
         var haystack = $"{job.Title} {job.Description}";
-
-        if (excludeKeywords.Any(k => !string.IsNullOrWhiteSpace(k) && job.Title.Contains(k, StringComparison.OrdinalIgnoreCase)))
+        if (excludeKeywords.Any(keyword =>
+                !string.IsNullOrWhiteSpace(keyword)
+                && job.Title.Contains(keyword, StringComparison.OrdinalIgnoreCase)))
+        {
             return false;
+        }
 
         return includeKeywords.Count == 0
-            || includeKeywords.Where(k => !string.IsNullOrWhiteSpace(k))
-                .Any(k => haystack.Contains(k, StringComparison.OrdinalIgnoreCase));
+            || includeKeywords.Where(keyword => !string.IsNullOrWhiteSpace(keyword))
+                .Any(keyword => haystack.Contains(keyword, StringComparison.OrdinalIgnoreCase));
     }
 
     private static int GetRelevancePriority(JobPosting job)

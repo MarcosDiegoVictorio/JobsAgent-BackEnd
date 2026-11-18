@@ -13,6 +13,24 @@ public sealed class AgentOptions
     public List<string> ExcludeTitleKeywords { get; set; } = [];
 }
 
+public sealed class AuthOptions
+{
+    public string GoogleClientId { get; set; } = "";
+    public string AdminEmail { get; set; } = "";
+    public string JwtSigningKey { get; set; } = "";
+    public string Issuer { get; set; } = "JobAgent";
+    public string Audience { get; set; } = "JobAgent.Client";
+    public int TokenLifetimeMinutes { get; set; } = 30;
+    public string FrontendUrl { get; set; } = "";
+}
+
+public sealed class DatabaseOptions
+{
+    public string Provider { get; set; } = "SQLite";
+    public string SqlitePath { get; set; } = "jobs.db";
+    public string ConnectionString { get; set; } = "";
+}
+
 public sealed class GeminiOptions
 {
     public string ApiKey { get; set; } = "";

@@ -6,4 +6,7 @@
     <Project Path="src/JobAgent.WebApi/JobAgent.WebApi.csproj" />
     <Project Path="src/JobAgent.Worker/JobAgent.Worker.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/JobAgent.Repository.Tests/JobAgent.Repository.Tests.csproj" />
+  </Folder>
 </Solution>

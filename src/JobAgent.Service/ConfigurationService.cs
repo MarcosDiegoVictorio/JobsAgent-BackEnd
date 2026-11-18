@@ -5,11 +5,13 @@ using JobAgent.Domain.Models;
 using MailKit.Net.Imap;
 using MailKit.Security;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Options;
 
 namespace JobAgent.Service;
 
 public sealed class ConfigurationService(
+    IConfiguration configuration,
     IOptionsMonitor<AgentOptions> agentOptions,
     IOptionsMonitor<GeminiOptions> geminiOptions,
     IOptionsMonitor<AnthropicOptions> anthropicOptions,
@@ -33,11 +35,14 @@ public sealed class ConfigurationService(
         var config = new AppConfigDto
         {
             Agent = agentOptions.CurrentValue,
-            Gemini = geminiOptions.CurrentValue,
-            Anthropic = anthropicOptions.CurrentValue,
-            Telegram = telegramOptions.CurrentValue,
             Rss = rssOptions.CurrentValue,
-            Email = emailOptions.CurrentValue
+            GeminiConfigured = !string.IsNullOrWhiteSpace(geminiOptions.CurrentValue.ApiKey),
+            AnthropicConfigured = !string.IsNullOrWhiteSpace(anthropicOptions.CurrentValue.ApiKey),
+            TelegramConfigured = !string.IsNullOrWhiteSpace(telegramOptions.CurrentValue.BotToken)
+                && !string.IsNullOrWhiteSpace(telegramOptions.CurrentValue.ChatId),
+            EmailConfigured = emailOptions.CurrentValue.Enabled
+                && !string.IsNullOrWhiteSpace(emailOptions.CurrentValue.User)
+                && !string.IsNullOrWhiteSpace(emailOptions.CurrentValue.AppPassword)
         };
 
         return Task.FromResult(config);
@@ -59,28 +64,16 @@ public sealed class ConfigurationService(
             root = [];
         }
 
-        // Update or insert sections
         root["Agent"] = JsonSerializer.SerializeToNode(config.Agent);
-        root["Gemini"] = JsonSerializer.SerializeToNode(config.Gemini);
-        root["Anthropic"] = JsonSerializer.SerializeToNode(config.Anthropic);
-        root["Telegram"] = JsonSerializer.SerializeToNode(config.Telegram);
         root["Rss"] = JsonSerializer.SerializeToNode(config.Rss);
-        root["Email"] = JsonSerializer.SerializeToNode(config.Email);
 
         var options = new JsonSerializerOptions { WriteIndented = true };
         var jsonString = root.ToJsonString(options);
 
         await File.WriteAllTextAsync(filePath, jsonString, ct);
-
-        // Also check if appsettings.json exists in root project dir
-        var parentDir = Directory.GetParent(Directory.GetCurrentDirectory())?.FullName;
-        if (parentDir != null)
+        if (configuration is IConfigurationRoot rootConfiguration)
         {
-            var rootSettings = Path.Combine(parentDir, "appsettings.json");
-            if (File.Exists(rootSettings) && rootSettings != filePath)
-            {
-                await File.WriteAllTextAsync(rootSettings, jsonString, ct);
-            }
+            rootConfiguration.Reload();
         }
     }
 

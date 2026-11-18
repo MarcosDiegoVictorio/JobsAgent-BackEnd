@@ -12,7 +12,20 @@ API REST e agente em segundo plano do JobAgent, em .NET 10. Este repositório n�
    Copy-Item src/JobAgent.WebApi/appsettings.example.json src/JobAgent.WebApi/appsettings.json
    ```
 
-3. Configure suas chaves e integrações pelo painel do frontend ou nos arquivos locais ignorados pelo Git.
+3. Configure login e provedores no ambiente local. Não coloque credenciais no frontend.
+
+   No PowerShell, configure o cliente OAuth do Google, o e-mail que será o administrador inicial e
+   uma chave JWT aleatória com pelo menos 32 bytes:
+
+   ```powershell
+   $env:Auth__GoogleClientId = "<Google OAuth Client ID>"
+   $env:Auth__AdminEmail = "seu-email@gmail.com"
+   $env:Auth__JwtSigningKey = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(48))
+   ```
+
+   No Google Cloud Console, autorize a origem JavaScript `http://localhost:4200` para o Client ID.
+   Para produção, use as origens reais do frontend e mantenha esses valores em variáveis seguras do
+   provedor de hospedagem.
 4. Inicie a API:
 
    ```powershell
@@ -20,13 +33,6 @@ API REST e agente em segundo plano do JobAgent, em .NET 10. Este repositório n�
    ```
 
    A API e o Scalar/OpenAPI ficam disponíveis em `http://localhost:5065` e `http://localhost:5065/scalar/v1`.
-
-Para executar o worker sem a API, prepare a configuração local do worker e rode:
-
-```powershell
-Copy-Item src/JobAgent.Worker/appsettings.example.json src/JobAgent.Worker/appsettings.json
-dotnet run --project src/JobAgent.Worker
-```
 
 ## Frontend separado
 
@@ -37,6 +43,32 @@ Para hospedar a interface e a API em origens diferentes:
 - Configure `apiBaseUrl` em `public/config.js` com a URL completa da API, incluindo `/api`.
 - Configure `Cors:AllowedOrigins` no backend com a origem exata do frontend. Em produção, use a variável de ambiente `Cors__AllowedOrigins__0`.
 - Não coloque chaves de Gemini, Anthropic, Telegram ou e-mail no frontend.
+- Configure credenciais de provedores de IA no servidor, por exemplo `Gemini__ApiKey`; elas não são
+  devolvidas pela API nem podem ser alteradas pelo navegador.
+
+## Beta por convite
+
+- O primeiro acesso exige login Google. O e-mail definido em `Auth__AdminEmail` cria a conta
+  administradora; os demais usuários precisam de um convite emitido pelo administrador.
+- Cada conta começa com uma busca. Uma tentativa aceita consome um crédito; somente o administrador
+  pode liberar créditos adicionais.
+- Cada conta pode salvar no máximo 10 vagas, somando todos os perfis. Os limites são verificados no
+  backend, não apenas na interface.
+- Perfis e vagas são isolados por usuário. A busca automática e a leitura de alertas de e-mail estão
+  desativadas; cada busca é iniciada manualmente por uma conta autenticada.
+- O perfil profissional é enviado ao provedor de IA configurado no servidor para avaliar vagas.
+  Informe os usuários sobre esse processamento antes de convidá-los.
+
+## Banco de dados
+
+SQLite continua disponível para desenvolvimento local. Para PostgreSQL, configure
+`ConnectionStrings__JobAgent` com a connection string fornecida pelo host; a presença dessa variável
+seleciona PostgreSQL automaticamente. Proteja-a como segredo e não a versione.
+
+O banco PostgreSQL começa com um esquema vazio. No SQLite existente, o primeiro login do
+administrador importa os perfis e, no máximo, as 10 vagas antigas de maior nota; não apaga os demais
+registros. A cópia automática de um arquivo SQLite local para PostgreSQL ainda não está disponível:
+preserve o backup e faça essa migração antes de apontar produção para PostgreSQL.
 
 ## Dados locais
 
@@ -44,7 +76,9 @@ Os arquivos `appsettings.json`, `jobs.db` e `profile/candidate.md` são locais e
 
 ## Endpoints
 
-A API fornece endpoints em `/api/jobs`, `/api/config`, `/api/profile` e `/api/orchestrator`. O contrato completo está no Scalar em ambiente de desenvolvimento.
+A API fornece login em `/api/auth`, conta em `/api/account`, administração em `/api/admin` e
+endpoints autenticados em `/api/jobs`, `/api/profile` e `/api/orchestrator`. A configuração de
+provedores é restrita ao administrador. O contrato completo está no Scalar em ambiente de desenvolvimento.
 
 ## Perfis e fontes
 

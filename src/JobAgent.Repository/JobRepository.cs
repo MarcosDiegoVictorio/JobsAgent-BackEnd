@@ -1,234 +1,156 @@
+using System.Data.Common;
 using System.Globalization;
 using JobAgent.Domain.Entities;
 using JobAgent.Domain.Enums;
 using JobAgent.Domain.Interfaces;
 using JobAgent.Domain.Models;
-using Microsoft.Data.Sqlite;
-using Microsoft.Extensions.Options;
 
 namespace JobAgent.Repository;
 
-public sealed class JobRepository(IOptions<AgentOptions> options) : IJobRepository
+public sealed class JobRepository(
+    DatabaseConnectionFactory connections,
+    DatabaseInitializer initializer) : IJobRepository
 {
-    private string ConnectionString
+    public Task InitAsync(CancellationToken ct = default) => initializer.InitializeAsync(ct);
+
+    public async Task<bool> ExistsAsync(string id, string userId, string profileId, CancellationToken ct = default)
     {
-        get
-        {
-            var dbPath = options.Value.DatabasePath;
-            if (!Path.IsPathRooted(dbPath))
-            {
-                dbPath = Path.Combine(AppContext.BaseDirectory, dbPath);
-            }
-            return $"Data Source={dbPath}";
-        }
+        await using var connection = await connections.OpenConnectionAsync(ct);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT 1 FROM jobs
+            WHERE id = @id AND user_id = @userId AND profile_id = @profileId
+            LIMIT 1
+            """;
+        Add(command, ("@id", id), ("@userId", userId), ("@profileId", profileId));
+        return await command.ExecuteScalarAsync(ct) is not null;
     }
 
-    public async Task InitAsync(CancellationToken ct = default)
+    public async Task<bool> SaveAsync(
+        JobPosting job,
+        JobScore score,
+        string userId,
+        string profileId,
+        CancellationToken ct = default)
     {
-        await using var conn = new SqliteConnection(ConnectionString);
-        await conn.OpenAsync(ct);
+        await using var connection = await connections.OpenConnectionAsync(ct);
+        await using var transaction = await connection.BeginTransactionAsync(ct);
 
-        var cmd = conn.CreateCommand();
-        cmd.CommandText = """
-            CREATE TABLE IF NOT EXISTS jobs (
-                id                TEXT PRIMARY KEY,
-                profile_id        TEXT NOT NULL DEFAULT 'default',
-                source            TEXT NOT NULL,
-                title             TEXT NOT NULL,
-                company           TEXT NOT NULL,
-                url               TEXT NOT NULL,
-                score             INTEGER NOT NULL,
-                summary           TEXT NOT NULL,
-                strengths         TEXT NOT NULL,
-                gaps              TEXT NOT NULL,
-                cv_tips           TEXT NOT NULL,
-                recruiter_message TEXT NOT NULL,
-                status            TEXT NOT NULL DEFAULT 'novo',
-                notes             TEXT,
-                created_at        TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_jobs_score ON jobs(score);
-            CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-            CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at);
-            CREATE TABLE IF NOT EXISTS candidate_profiles (
-                id              TEXT PRIMARY KEY,
-                name            TEXT NOT NULL COLLATE NOCASE UNIQUE,
-                profile_markdown TEXT NOT NULL,
-                is_active       INTEGER NOT NULL DEFAULT 0,
-                created_at      TEXT NOT NULL,
-                updated_at      TEXT NOT NULL
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_candidate_profiles_active
-                ON candidate_profiles(is_active) WHERE is_active = 1;
-            CREATE TABLE IF NOT EXISTS candidate_profile_keywords (
-                profile_id  TEXT NOT NULL REFERENCES candidate_profiles(id) ON DELETE CASCADE,
-                keyword     TEXT NOT NULL COLLATE NOCASE,
-                is_excluded INTEGER NOT NULL,
-                sort_order  INTEGER NOT NULL,
-                PRIMARY KEY (profile_id, is_excluded, sort_order)
-            );
-            CREATE INDEX IF NOT EXISTS idx_candidate_profile_keywords_profile
-                ON candidate_profile_keywords(profile_id);
-            """;
-        await cmd.ExecuteNonQueryAsync(ct);
-
-        // Auto migration for existing databases lacking 'notes' column
-        try
+        if (connections.IsPostgreSql)
         {
-            var alterCmd = conn.CreateCommand();
-            alterCmd.CommandText = "ALTER TABLE jobs ADD COLUMN notes TEXT;";
-            await alterCmd.ExecuteNonQueryAsync(ct);
-        }
-        catch (SqliteException ex) when (ex.SqliteErrorCode == 1) // duplicate column name
-        {
-            // Column already exists
-        }
-
-        var columnsCmd = conn.CreateCommand();
-        columnsCmd.CommandText = "PRAGMA table_info(jobs);";
-        var hasProfileId = false;
-        await using (var reader = await columnsCmd.ExecuteReaderAsync(ct))
-        {
-            while (await reader.ReadAsync(ct))
+            await using var lockUser = connection.CreateCommand();
+            lockUser.Transaction = transaction;
+            lockUser.CommandText = "SELECT id FROM users WHERE id = @userId FOR UPDATE";
+            Add(lockUser, ("@userId", userId));
+            if (await lockUser.ExecuteScalarAsync(ct) is null)
             {
-                if (reader.GetString(1).Equals("profile_id", StringComparison.OrdinalIgnoreCase))
-                {
-                    hasProfileId = true;
-                    break;
-                }
+                throw new InvalidOperationException("Usuário não encontrado.");
             }
         }
 
-        if (!hasProfileId)
+        await using var count = connection.CreateCommand();
+        count.Transaction = transaction;
+        count.CommandText = "SELECT COUNT(*) FROM jobs WHERE user_id = @userId";
+        Add(count, ("@userId", userId));
+        var savedCount = Convert.ToInt32(await count.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
+        if (savedCount >= 10)
         {
-            var migrateCmd = conn.CreateCommand();
-            migrateCmd.CommandText = "ALTER TABLE jobs ADD COLUMN profile_id TEXT NOT NULL DEFAULT 'default';";
-            await migrateCmd.ExecuteNonQueryAsync(ct);
+            await transaction.RollbackAsync(ct);
+            return false;
         }
 
-        var profileIndexCmd = conn.CreateCommand();
-        profileIndexCmd.CommandText = """
-            CREATE INDEX IF NOT EXISTS idx_jobs_profile_created ON jobs(profile_id, created_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_jobs_profile_score ON jobs(profile_id, score);
-            """;
-        await profileIndexCmd.ExecuteNonQueryAsync(ct);
-    }
-
-    public async Task<bool> ExistsAsync(string id, string profileId, CancellationToken ct = default)
-    {
-        await using var conn = new SqliteConnection(ConnectionString);
-        await conn.OpenAsync(ct);
-
-        var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT 1 FROM jobs WHERE id = $id AND profile_id = $profileId LIMIT 1";
-        cmd.Parameters.AddWithValue("$id", id);
-        cmd.Parameters.AddWithValue("$profileId", profileId);
-        return await cmd.ExecuteScalarAsync(ct) is not null;
-    }
-
-    public async Task SaveAsync(JobPosting job, JobScore score, string profileId, CancellationToken ct = default)
-    {
-        await using var conn = new SqliteConnection(ConnectionString);
-        await conn.OpenAsync(ct);
-
-        var cmd = conn.CreateCommand();
-        cmd.CommandText = """
-            INSERT OR IGNORE INTO jobs
-                (id, profile_id, source, title, company, url, score, summary, strengths, gaps, cv_tips, recruiter_message, status, notes, created_at)
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO jobs
+                (id, user_id, profile_id, source, title, company, url, score, summary,
+                 strengths, gaps, cv_tips, recruiter_message, status, notes, created_at)
             VALUES
-                ($id, $profileId, $source, $title, $company, $url, $score, $summary, $strengths, $gaps, $cv, $msg, 'novo', NULL, $created);
+                (@id, @userId, @profileId, @source, @title, @company, @url, @score, @summary,
+                 @strengths, @gaps, @cv, @msg, 'novo', NULL, @created)
+            ON CONFLICT (id) DO NOTHING
             """;
-        cmd.Parameters.AddWithValue("$id", job.Id);
-        cmd.Parameters.AddWithValue("$profileId", profileId);
-        cmd.Parameters.AddWithValue("$source", job.Source);
-        cmd.Parameters.AddWithValue("$title", job.Title);
-        cmd.Parameters.AddWithValue("$company", job.Company);
-        cmd.Parameters.AddWithValue("$url", job.Url);
-        cmd.Parameters.AddWithValue("$score", score.Score);
-        cmd.Parameters.AddWithValue("$summary", score.Summary);
-        cmd.Parameters.AddWithValue("$strengths", string.Join(" | ", score.Strengths));
-        cmd.Parameters.AddWithValue("$gaps", string.Join(" | ", score.Gaps));
-        cmd.Parameters.AddWithValue("$cv", score.CvTips);
-        cmd.Parameters.AddWithValue("$msg", score.RecruiterMessage);
-        cmd.Parameters.AddWithValue("$created", DateTimeOffset.UtcNow.ToString("O"));
-
-        await cmd.ExecuteNonQueryAsync(ct);
+        Add(command,
+            ("@id", job.Id),
+            ("@userId", userId),
+            ("@profileId", profileId),
+            ("@source", job.Source),
+            ("@title", job.Title),
+            ("@company", job.Company),
+            ("@url", job.Url),
+            ("@score", score.Score),
+            ("@summary", score.Summary),
+            ("@strengths", string.Join(" | ", score.Strengths)),
+            ("@gaps", string.Join(" | ", score.Gaps)),
+            ("@cv", score.CvTips),
+            ("@msg", score.RecruiterMessage),
+            ("@created", DateTimeOffset.UtcNow.ToString("O")));
+        var inserted = await command.ExecuteNonQueryAsync(ct) > 0;
+        await transaction.CommitAsync(ct);
+        return inserted;
     }
 
-    public async Task<Job?> GetByIdAsync(string id, string profileId, CancellationToken ct = default)
+    public async Task<Job?> GetByIdAsync(string id, string userId, string profileId, CancellationToken ct = default)
     {
-        await using var conn = new SqliteConnection(ConnectionString);
-        await conn.OpenAsync(ct);
-
-        var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT * FROM jobs WHERE id = $id AND profile_id = $profileId LIMIT 1";
-        cmd.Parameters.AddWithValue("$id", id);
-        cmd.Parameters.AddWithValue("$profileId", profileId);
-
-        await using var reader = await cmd.ExecuteReaderAsync(ct);
-        if (await reader.ReadAsync(ct))
-        {
-            return MapJob(reader);
-        }
-
-        return null;
+        await using var connection = await connections.OpenConnectionAsync(ct);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT * FROM jobs
+            WHERE id = @id AND user_id = @userId AND profile_id = @profileId
+            LIMIT 1
+            """;
+        Add(command, ("@id", id), ("@userId", userId), ("@profileId", profileId));
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        return await reader.ReadAsync(ct) ? MapJob(reader) : null;
     }
 
     public async Task<PagedResult<Job>> GetPagedAsync(JobFilter filter, CancellationToken ct = default)
     {
-        await using var conn = new SqliteConnection(ConnectionString);
-        await conn.OpenAsync(ct);
-
-        var whereClauses = new List<string>();
-        var parameters = new List<SqliteParameter>();
-
-        whereClauses.Add("profile_id = $profileId");
-        parameters.Add(new SqliteParameter("$profileId", filter.ProfileId));
+        await using var connection = await connections.OpenConnectionAsync(ct);
+        var conditions = new List<string> { "user_id = @userId", "profile_id = @profileId" };
+        var parameters = new List<(string Name, object Value)>
+        {
+            ("@userId", filter.UserId),
+            ("@profileId", filter.ProfileId)
+        };
 
         if (!string.IsNullOrWhiteSpace(filter.Status))
         {
-            whereClauses.Add("status = $status");
-            parameters.Add(new SqliteParameter("$status", filter.Status.Trim().ToLowerInvariant()));
+            conditions.Add("status = @status");
+            parameters.Add(("@status", filter.Status.Trim().ToLowerInvariant()));
         }
 
         if (filter.MinScore.HasValue)
         {
-            whereClauses.Add("score >= $minScore");
-            parameters.Add(new SqliteParameter("$minScore", filter.MinScore.Value));
+            conditions.Add("score >= @minScore");
+            parameters.Add(("@minScore", filter.MinScore.Value));
         }
 
         if (filter.MaxScore.HasValue)
         {
-            whereClauses.Add("score <= $maxScore");
-            parameters.Add(new SqliteParameter("$maxScore", filter.MaxScore.Value));
+            conditions.Add("score <= @maxScore");
+            parameters.Add(("@maxScore", filter.MaxScore.Value));
         }
 
         if (!string.IsNullOrWhiteSpace(filter.Source))
         {
-            whereClauses.Add("source LIKE $source");
-            parameters.Add(new SqliteParameter("$source", $"%{filter.Source.Trim()}%"));
+            conditions.Add("source LIKE @source");
+            parameters.Add(("@source", $"%{filter.Source.Trim()}%"));
         }
 
         if (!string.IsNullOrWhiteSpace(filter.Search))
         {
-            whereClauses.Add("(title LIKE $search OR company LIKE $search OR summary LIKE $search)");
-            parameters.Add(new SqliteParameter("$search", $"%{filter.Search.Trim()}%"));
+            conditions.Add("(title LIKE @search OR company LIKE @search OR summary LIKE @search)");
+            parameters.Add(("@search", $"%{filter.Search.Trim()}%"));
         }
 
-        var whereSql = whereClauses.Count > 0 ? $"WHERE {string.Join(" AND ", whereClauses)}" : "";
+        var whereSql = $"WHERE {string.Join(" AND ", conditions)}";
+        await using var countCommand = connection.CreateCommand();
+        countCommand.CommandText = $"SELECT COUNT(*) FROM jobs {whereSql}";
+        Add(countCommand, parameters.ToArray());
+        var totalCount = Convert.ToInt32(await countCommand.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
 
-        // Count total
-        var countCmd = conn.CreateCommand();
-        countCmd.CommandText = $"SELECT COUNT(*) FROM jobs {whereSql}";
-        foreach (var p in parameters)
-        {
-            countCmd.Parameters.Add(new SqliteParameter(p.ParameterName, p.Value));
-        }
-
-        var totalCount = Convert.ToInt32(await countCmd.ExecuteScalarAsync(ct));
-
-        // Query items
-        var orderByCol = filter.OrderBy?.ToLowerInvariant() switch
+        var orderBy = filter.OrderBy?.ToLowerInvariant() switch
         {
             "created_at" or "date" => "created_at",
             "title" => "title",
@@ -236,122 +158,98 @@ public sealed class JobRepository(IOptions<AgentOptions> options) : IJobReposito
             _ => "score"
         };
         var direction = filter.Descending ? "DESC" : "ASC";
-
         var page = Math.Max(1, filter.Page);
         var pageSize = Math.Clamp(filter.PageSize, 1, 100);
-        var offset = (page - 1) * pageSize;
-
-        var queryCmd = conn.CreateCommand();
-        queryCmd.CommandText = $"""
-            SELECT * FROM jobs
-            {whereSql}
-            ORDER BY {orderByCol} {direction}, created_at DESC
-            LIMIT $limit OFFSET $offset
+        await using var query = connection.CreateCommand();
+        query.CommandText = $"""
+            SELECT * FROM jobs {whereSql}
+            ORDER BY {orderBy} {direction}, created_at DESC
+            LIMIT @limit OFFSET @offset
             """;
+        Add(query, parameters.ToArray());
+        Add(query, ("@limit", pageSize), ("@offset", (page - 1) * pageSize));
 
-        foreach (var p in parameters)
-        {
-            queryCmd.Parameters.Add(new SqliteParameter(p.ParameterName, p.Value));
-        }
-        queryCmd.Parameters.AddWithValue("$limit", pageSize);
-        queryCmd.Parameters.AddWithValue("$offset", offset);
-
-        var list = new List<Job>();
-        await using var reader = await queryCmd.ExecuteReaderAsync(ct);
+        var jobs = new List<Job>();
+        await using var reader = await query.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
         {
-            list.Add(MapJob(reader));
+            jobs.Add(MapJob(reader));
         }
 
-        return new PagedResult<Job>
-        {
-            Items = list,
-            TotalCount = totalCount,
-            Page = page,
-            PageSize = pageSize
-        };
+        return new PagedResult<Job> { Items = jobs, TotalCount = totalCount, Page = page, PageSize = pageSize };
     }
 
-    public async Task<bool> UpdateStatusAsync(string id, string profileId, string status, string? notes = null, CancellationToken ct = default)
+    public async Task<bool> UpdateStatusAsync(
+        string id,
+        string userId,
+        string profileId,
+        string status,
+        string? notes = null,
+        CancellationToken ct = default)
     {
-        await using var conn = new SqliteConnection(ConnectionString);
-        await conn.OpenAsync(ct);
-
-        var cmd = conn.CreateCommand();
+        await using var connection = await connections.OpenConnectionAsync(ct);
+        await using var command = connection.CreateCommand();
+        command.CommandText = notes is null
+            ? "UPDATE jobs SET status = @status WHERE id = @id AND user_id = @userId AND profile_id = @profileId"
+            : "UPDATE jobs SET status = @status, notes = @notes WHERE id = @id AND user_id = @userId AND profile_id = @profileId";
+        Add(command, ("@id", id), ("@userId", userId), ("@profileId", profileId),
+            ("@status", status.Trim().ToLowerInvariant()));
         if (notes is not null)
         {
-            cmd.CommandText = "UPDATE jobs SET status = $status, notes = $notes WHERE id = $id AND profile_id = $profileId";
-            cmd.Parameters.AddWithValue("$notes", notes);
-        }
-        else
-        {
-            cmd.CommandText = "UPDATE jobs SET status = $status WHERE id = $id AND profile_id = $profileId";
+            Add(command, ("@notes", notes));
         }
 
-        cmd.Parameters.AddWithValue("$id", id);
-        cmd.Parameters.AddWithValue("$profileId", profileId);
-        cmd.Parameters.AddWithValue("$status", status.Trim().ToLowerInvariant());
-
-        var rows = await cmd.ExecuteNonQueryAsync(ct);
-        return rows > 0;
+        return await command.ExecuteNonQueryAsync(ct) > 0;
     }
 
-    public async Task<bool> DeleteAsync(string id, string profileId, CancellationToken ct = default)
+    public async Task<bool> DeleteAsync(
+        string id,
+        string userId,
+        string profileId,
+        CancellationToken ct = default)
     {
-        await using var conn = new SqliteConnection(ConnectionString);
-        await conn.OpenAsync(ct);
-
-        var cmd = conn.CreateCommand();
-        cmd.CommandText = "DELETE FROM jobs WHERE id = $id AND profile_id = $profileId";
-        cmd.Parameters.AddWithValue("$id", id);
-        cmd.Parameters.AddWithValue("$profileId", profileId);
-
-        var rows = await cmd.ExecuteNonQueryAsync(ct);
-        return rows > 0;
+        await using var connection = await connections.OpenConnectionAsync(ct);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            DELETE FROM jobs WHERE id = @id AND user_id = @userId AND profile_id = @profileId
+            """;
+        Add(command, ("@id", id), ("@userId", userId), ("@profileId", profileId));
+        return await command.ExecuteNonQueryAsync(ct) > 0;
     }
 
-    public async Task<JobStatistics> GetStatisticsAsync(string profileId, CancellationToken ct = default)
+    public async Task<JobStatistics> GetStatisticsAsync(string userId, CancellationToken ct = default)
     {
-        await using var conn = new SqliteConnection(ConnectionString);
-        await conn.OpenAsync(ct);
-
+        await using var connection = await connections.OpenConnectionAsync(ct);
         var stats = new JobStatistics();
 
-        // Status counts & averages
-        var cmd = conn.CreateCommand();
-        cmd.CommandText = """
-            SELECT 
-                COUNT(*) as total,
-                COALESCE(AVG(score), 0.0) as avg_score,
-                SUM(CASE WHEN score >= 7 THEN 1 ELSE 0 END) as high_score
-            FROM jobs
-            WHERE profile_id = $profileId
-            """;
-        cmd.Parameters.AddWithValue("$profileId", profileId);
-
-        await using (var reader = await cmd.ExecuteReaderAsync(ct))
+        await using (var command = connection.CreateCommand())
         {
+            command.CommandText = """
+                SELECT COUNT(*), COALESCE(AVG(score), 0.0),
+                       SUM(CASE WHEN score >= 7 THEN 1 ELSE 0 END)
+                FROM jobs WHERE user_id = @userId
+                """;
+            Add(command, ("@userId", userId));
+            await using var reader = await command.ExecuteReaderAsync(ct);
             if (await reader.ReadAsync(ct))
             {
-                stats.TotalJobs = reader.IsDBNull(0) ? 0 : reader.GetInt32(0);
-                stats.AverageScore = reader.IsDBNull(1) ? 0.0 : Math.Round(reader.GetDouble(1), 1);
-                stats.HighScoreJobs = reader.IsDBNull(2) ? 0 : reader.GetInt32(2);
+                stats.TotalJobs = reader.IsDBNull(0) ? 0 : Convert.ToInt32(reader.GetValue(0), CultureInfo.InvariantCulture);
+                stats.AverageScore = reader.IsDBNull(1) ? 0 : Math.Round(Convert.ToDouble(reader.GetValue(1), CultureInfo.InvariantCulture), 1);
+                stats.HighScoreJobs = reader.IsDBNull(2) ? 0 : Convert.ToInt32(reader.GetValue(2), CultureInfo.InvariantCulture);
             }
         }
 
-        // Status breakdown
-        var statusCmd = conn.CreateCommand();
-        statusCmd.CommandText = "SELECT status, COUNT(*) FROM jobs WHERE profile_id = $profileId GROUP BY status";
-        statusCmd.Parameters.AddWithValue("$profileId", profileId);
-        await using (var reader = await statusCmd.ExecuteReaderAsync(ct))
+        await using (var command = connection.CreateCommand())
         {
+            command.CommandText = "SELECT status, COUNT(*) FROM jobs WHERE user_id = @userId GROUP BY status";
+            Add(command, ("@userId", userId));
+            await using var reader = await command.ExecuteReaderAsync(ct);
             while (await reader.ReadAsync(ct))
             {
-                var s = reader.GetString(0);
-                var count = reader.GetInt32(1);
-                stats.StatusDistribution[s] = count;
-
-                switch (s.ToLowerInvariant())
+                var status = reader.GetString(0);
+                var count = Convert.ToInt32(reader.GetValue(1), CultureInfo.InvariantCulture);
+                stats.StatusDistribution[status] = count;
+                switch (status.ToLowerInvariant())
                 {
                     case JobStatus.Novo: stats.NewJobs = count; break;
                     case JobStatus.Aplicado: stats.AppliedJobs = count; break;
@@ -362,40 +260,54 @@ public sealed class JobRepository(IOptions<AgentOptions> options) : IJobReposito
             }
         }
 
-        // Score breakdown
-        var scoreCmd = conn.CreateCommand();
-        scoreCmd.CommandText = "SELECT score, COUNT(*) FROM jobs WHERE profile_id = $profileId GROUP BY score ORDER BY score ASC";
-        scoreCmd.Parameters.AddWithValue("$profileId", profileId);
-        await using (var reader = await scoreCmd.ExecuteReaderAsync(ct))
+        await using (var command = connection.CreateCommand())
         {
+            command.CommandText = """
+                SELECT score, COUNT(*) FROM jobs WHERE user_id = @userId
+                GROUP BY score ORDER BY score ASC
+                """;
+            Add(command, ("@userId", userId));
+            await using var reader = await command.ExecuteReaderAsync(ct);
             while (await reader.ReadAsync(ct))
             {
-                stats.ScoreDistribution[reader.GetInt32(0)] = reader.GetInt32(1);
+                stats.ScoreDistribution[Convert.ToInt32(reader.GetValue(0), CultureInfo.InvariantCulture)] =
+                    Convert.ToInt32(reader.GetValue(1), CultureInfo.InvariantCulture);
             }
         }
 
-        // Source breakdown
-        var srcCmd = conn.CreateCommand();
-        srcCmd.CommandText = "SELECT source, COUNT(*) FROM jobs WHERE profile_id = $profileId GROUP BY source ORDER BY COUNT(*) DESC LIMIT 10";
-        srcCmd.Parameters.AddWithValue("$profileId", profileId);
-        await using (var reader = await srcCmd.ExecuteReaderAsync(ct))
+        await using (var command = connection.CreateCommand())
         {
+            command.CommandText = """
+                SELECT source, COUNT(*) FROM jobs WHERE user_id = @userId
+                GROUP BY source ORDER BY COUNT(*) DESC LIMIT 10
+                """;
+            Add(command, ("@userId", userId));
+            await using var reader = await command.ExecuteReaderAsync(ct);
             while (await reader.ReadAsync(ct))
             {
-                stats.SourceDistribution[reader.GetString(0)] = reader.GetInt32(1);
+                stats.SourceDistribution[reader.GetString(0)] =
+                    Convert.ToInt32(reader.GetValue(1), CultureInfo.InvariantCulture);
             }
         }
 
         return stats;
     }
 
-    private static Job MapJob(SqliteDataReader reader)
+    public async Task<int> GetCountAsync(string userId, CancellationToken ct = default)
+    {
+        await using var connection = await connections.OpenConnectionAsync(ct);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM jobs WHERE user_id = @userId";
+        Add(command, ("@userId", userId));
+        return Convert.ToInt32(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
+    }
+
+    private static Job MapJob(DbDataReader reader)
     {
         var strengthsRaw = reader.GetString(reader.GetOrdinal("strengths"));
         var gapsRaw = reader.GetString(reader.GetOrdinal("gaps"));
-
-        var notesOrdinal = -1;
-        try { notesOrdinal = reader.GetOrdinal("notes"); } catch { }
+        var notesOrdinal = reader.GetOrdinal("notes");
+        var createdAt = reader.GetValue(reader.GetOrdinal("created_at")).ToString() ?? string.Empty;
 
         return new Job
         {
@@ -404,17 +316,25 @@ public sealed class JobRepository(IOptions<AgentOptions> options) : IJobReposito
             Title = reader.GetString(reader.GetOrdinal("title")),
             Company = reader.GetString(reader.GetOrdinal("company")),
             Url = reader.GetString(reader.GetOrdinal("url")),
-            Score = reader.GetInt32(reader.GetOrdinal("score")),
+            Score = Convert.ToInt32(reader.GetValue(reader.GetOrdinal("score")), CultureInfo.InvariantCulture),
             Summary = reader.GetString(reader.GetOrdinal("summary")),
             Strengths = string.IsNullOrWhiteSpace(strengthsRaw) ? [] : strengthsRaw.Split(" | ", StringSplitOptions.RemoveEmptyEntries).ToList(),
             Gaps = string.IsNullOrWhiteSpace(gapsRaw) ? [] : gapsRaw.Split(" | ", StringSplitOptions.RemoveEmptyEntries).ToList(),
             CvTips = reader.GetString(reader.GetOrdinal("cv_tips")),
             RecruiterMessage = reader.GetString(reader.GetOrdinal("recruiter_message")),
             Status = reader.GetString(reader.GetOrdinal("status")),
-            Notes = notesOrdinal >= 0 && !reader.IsDBNull(notesOrdinal) ? reader.GetString(notesOrdinal) : null,
-            CreatedAt = DateTimeOffset.TryParse(reader.GetString(reader.GetOrdinal("created_at")), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var dt)
-                ? dt
+            Notes = reader.IsDBNull(notesOrdinal) ? null : reader.GetString(notesOrdinal),
+            CreatedAt = DateTimeOffset.TryParse(createdAt, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var date)
+                ? date
                 : DateTimeOffset.UtcNow
         };
+    }
+
+    private static void Add(DbCommand command, params (string Name, object Value)[] parameters)
+    {
+        foreach (var (name, value) in parameters)
+        {
+            DatabaseInitializer.AddParameter(command, name, value);
+        }
     }
 }
